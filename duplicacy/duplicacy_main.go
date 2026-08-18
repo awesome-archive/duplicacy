@@ -147,6 +147,10 @@ func setGlobalOptions(context *cli.Context) {
 		duplicacy.SetLoggingLevel(duplicacy.DEBUG)
 	}
 
+	if context.GlobalBool("print-memory-usage") {
+		go duplicacy.PrintMemoryUsage()
+	}
+
 	ScriptEnabled = true
 	if context.GlobalBool("no-script") {
 		ScriptEnabled = false
@@ -157,6 +161,10 @@ func setGlobalOptions(context *cli.Context) {
 		go func() {
 			http.ListenAndServe(address, nil)
 		}()
+	}
+
+	for _, logID := range context.GlobalStringSlice("suppress") {
+		duplicacy.SuppressLog(logID)
 	}
 
 	duplicacy.RunInBackground = context.GlobalBool("background")
@@ -208,15 +216,20 @@ func runScript(context *cli.Context, storageName string, phase string) bool {
 	return true
 }
 
-func loadRSAPrivateKey(keyFile string, preference *duplicacy.Preference, backupManager *duplicacy.BackupManager, resetPasswords bool) {
+func loadRSAPrivateKey(keyFile string, passphrase string, preference *duplicacy.Preference, backupManager *duplicacy.BackupManager, resetPasswords bool) {
 	if keyFile == "" {
 		return
 	}
 
 	prompt := fmt.Sprintf("Enter the passphrase for %s:", keyFile)
-	passphrase := duplicacy.GetPassword(*preference, "rsa_passphrase", prompt, false, resetPasswords)
-	backupManager.LoadRSAPrivateKey(keyFile, passphrase)
-	duplicacy.SavePassword(*preference, "rsa_passphrase", passphrase)
+	if passphrase == "" {
+		passphrase = duplicacy.GetPassword(*preference, "rsa_passphrase", prompt, false, resetPasswords)
+		backupManager.LoadRSAPrivateKey(keyFile, passphrase)
+		duplicacy.SavePassword(*preference, "rsa_passphrase", passphrase)
+	} else {
+		backupManager.LoadRSAPrivateKey(keyFile, passphrase)
+	}
+
 }
 
 func initRepository(context *cli.Context) {
@@ -263,6 +276,13 @@ func configRepository(context *cli.Context, init bool) {
 			duplicacy.LOG_ERROR("PREFERENCE_INVALID", "'%s' is an invalid storage name", storageName)
 			return
 		}
+	}
+
+	snapshotIDRegex := regexp.MustCompile(`^[A-Za-z0-9_\-]+$`)
+	matched := snapshotIDRegex.FindStringSubmatch(snapshotID)
+	if matched == nil {
+		duplicacy.LOG_ERROR("PREFERENCE_INVALID", "'%s' is an invalid snapshot id", snapshotID)
+		return
 	}
 
 	var repository string
@@ -348,9 +368,8 @@ func configRepository(context *cli.Context, init bool) {
 			"The storage '%s' has already been initialized", preference.StorageURL)
 		if existingConfig.CompressionLevel >= -1 && existingConfig.CompressionLevel <= 9 {
 			duplicacy.LOG_INFO("STORAGE_FORMAT", "This storage is configured to use the pre-1.2.0 format")
-		} else if existingConfig.CompressionLevel != 100 {
-			duplicacy.LOG_ERROR("STORAGE_COMPRESSION", "This storage is configured with an invalid compression level %d", existingConfig.CompressionLevel)
-			return
+		} else if existingConfig.CompressionLevel != duplicacy.DEFAULT_COMPRESSION_LEVEL {
+			duplicacy.LOG_INFO("STORAGE_COMPRESSION", "Compression level: %d", existingConfig.CompressionLevel)
 		}
 
 		// Don't print config in the background mode
@@ -358,8 +377,6 @@ func configRepository(context *cli.Context, init bool) {
 			existingConfig.Print()
 		}
 	} else {
-		compressionLevel := 100
-
 		averageChunkSize := duplicacy.AtoSize(context.String("chunk-size"))
 		if averageChunkSize == 0 {
 			fmt.Fprintf(context.App.Writer, "Invalid average chunk size: %s.\n\n", context.String("chunk-size"))
@@ -449,8 +466,38 @@ func configRepository(context *cli.Context, init bool) {
 		if iterations == 0 {
 			iterations = duplicacy.CONFIG_DEFAULT_ITERATIONS
 		}
+
+		dataShards := 0
+		parityShards := 0
+		shards := context.String("erasure-coding")
+		if shards != "" {
+			shardsRegex := regexp.MustCompile(`^([0-9]+):([0-9]+)$`)
+			matched := shardsRegex.FindStringSubmatch(shards)
+			if matched == nil {
+				duplicacy.LOG_ERROR("STORAGE_ERASURECODE", "Invalid erasure coding parameters: %s", shards)
+			} else {
+				dataShards, _ = strconv.Atoi(matched[1])
+				parityShards, _ = strconv.Atoi(matched[2])
+				if dataShards == 0 || dataShards > 256 || parityShards == 0 || parityShards > dataShards {
+					duplicacy.LOG_ERROR("STORAGE_ERASURECODE", "Invalid erasure coding parameters: %s", shards)
+				}
+			}
+		}
+
+		compressionLevel := 100
+		zstdLevel := context.String("zstd-level")
+		if zstdLevel != "" {
+			if level, found := duplicacy.ZSTD_COMPRESSION_LEVELS[zstdLevel]; found {
+				compressionLevel = level
+			} else {
+				duplicacy.LOG_ERROR("STORAGE_COMPRESSION", "Invalid zstd compression level: %s", zstdLevel)
+			}
+		} else if context.Bool("zstd") {
+			compressionLevel = duplicacy.ZSTD_COMPRESSION_LEVEL_DEFAULT
+		}
+
 		duplicacy.ConfigStorage(storage, iterations, compressionLevel, averageChunkSize, maximumChunkSize,
-			minimumChunkSize, storagePassword, otherConfig, bitCopy, context.String("key"))
+			minimumChunkSize, storagePassword, otherConfig, bitCopy, context.String("key"), dataShards, parityShards)
 	}
 
 	duplicacy.Preferences = append(duplicacy.Preferences, preference)
@@ -554,6 +601,11 @@ func setPreference(context *cli.Context) {
 
 	if context.String("filters") != "" {
 		newPreference.FiltersFile = context.String("filters")
+	}
+
+	triBool = context.Generic("exclude-by-attribute").(*TriBool)
+	if triBool.IsSet() {
+		newPreference.ExcludeByAttribute = triBool.IsTrue()
 	}
 
 	key := context.String("key")
@@ -737,12 +789,26 @@ func backupRepository(context *cli.Context) {
 	uploadRateLimit := context.Int("limit-rate")
 	enumOnly := context.Bool("enum-only")
 	storage.SetRateLimits(0, uploadRateLimit)
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, preference.NobackupFile, preference.FiltersFile)
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, preference.NobackupFile, preference.FiltersFile, preference.ExcludeByAttribute)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
 	backupManager.SetDryRun(dryRun)
-	backupManager.Backup(repository, quickMode, threads, context.String("t"), showStatistics, enableVSS, vssTimeout, enumOnly)
+
+	zstdLevel := context.String("zstd-level")
+	if zstdLevel != "" {
+		if level, found := duplicacy.ZSTD_COMPRESSION_LEVELS[zstdLevel]; found {
+			backupManager.SetCompressionLevel(level)
+		} else {
+			duplicacy.LOG_ERROR("STORAGE_COMPRESSION", "Invalid zstd compression level: %s", zstdLevel)
+		}
+	} else if context.Bool("zstd") {
+		backupManager.SetCompressionLevel(duplicacy.ZSTD_COMPRESSION_LEVEL_DEFAULT)
+	}
+
+	metadataChunkSize := context.Int("metadata-chunk-size")
+	maximumInMemoryEntries := context.Int("max-in-memory-entries")
+	backupManager.Backup(repository, quickMode, threads, context.String("t"), showStatistics, enableVSS, vssTimeout, enumOnly, metadataChunkSize, maximumInMemoryEntries)
 
 	runScript(context, preference.Name, "post")
 }
@@ -790,6 +856,7 @@ func restoreRepository(context *cli.Context) {
 	setOwner := !context.Bool("ignore-owner")
 
 	showStatistics := context.Bool("stats")
+	persist := context.Bool("persist")
 
 	var patterns []string
 	for _, pattern := range context.Args() {
@@ -814,13 +881,17 @@ func restoreRepository(context *cli.Context) {
 	duplicacy.LOG_INFO("SNAPSHOT_FILTER", "Loaded %d include/exclude pattern(s)", len(patterns))
 
 	storage.SetRateLimits(context.Int("limit-rate"), 0)
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, preference.NobackupFile, preference.FiltersFile)
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, preference.NobackupFile, preference.FiltersFile, preference.ExcludeByAttribute)
 	duplicacy.SavePassword(*preference, "password", password)
 
-	loadRSAPrivateKey(context.String("key"), preference, backupManager, false)
+	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.Restore(repository, revision, true, quickMode, threads, overwrite, deleteMode, setOwner, showStatistics, patterns)
+	failed := backupManager.Restore(repository, revision, true, quickMode, threads, overwrite, deleteMode, setOwner, showStatistics, patterns, persist)
+	if failed > 0 {
+		duplicacy.LOG_ERROR("RESTORE_FAIL", "%d file(s) were not restored correctly", failed)
+		return
+	}
 
 	runScript(context, preference.Name, "post")
 }
@@ -856,7 +927,7 @@ func listSnapshots(context *cli.Context) {
 	tag := context.String("t")
 	revisions := getRevisions(context)
 
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", preference.ExcludeByAttribute)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	id := preference.SnapshotID
@@ -870,7 +941,7 @@ func listSnapshots(context *cli.Context) {
 	showChunks := context.Bool("chunks")
 
 	// list doesn't need to decrypt file chunks; but we need -key here so we can reset the passphrase for the private key
-	loadRSAPrivateKey(context.String("key"), preference, backupManager, resetPassword)
+	loadRSAPrivateKey(context.String("key"), "", preference, backupManager, resetPassword)
 
 	backupManager.SetupSnapshotCache(preference.Name)
 	backupManager.SnapshotManager.ListSnapshots(id, revisions, tag, showFiles, showChunks)
@@ -879,6 +950,7 @@ func listSnapshots(context *cli.Context) {
 }
 
 func checkSnapshots(context *cli.Context) {
+
 	setGlobalOptions(context)
 	defer duplicacy.CatchLogException()
 
@@ -894,7 +966,12 @@ func checkSnapshots(context *cli.Context) {
 
 	runScript(context, preference.Name, "pre")
 
-	storage := duplicacy.CreateStorage(*preference, false, 1)
+	threads := context.Int("threads")
+	if threads < 1 {
+		threads = 1
+	}
+
+	storage := duplicacy.CreateStorage(*preference, false, threads)
 	if storage == nil {
 		return
 	}
@@ -907,10 +984,10 @@ func checkSnapshots(context *cli.Context) {
 	tag := context.String("t")
 	revisions := getRevisions(context)
 
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
-	loadRSAPrivateKey(context.String("key"), preference, backupManager, false)
+	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	id := preference.SnapshotID
 	if context.Bool("all") {
@@ -922,11 +999,14 @@ func checkSnapshots(context *cli.Context) {
 	showStatistics := context.Bool("stats")
 	showTabular := context.Bool("tabular")
 	checkFiles := context.Bool("files")
+	checkChunks := context.Bool("chunks")
 	searchFossils := context.Bool("fossils")
 	resurrect := context.Bool("resurrect")
+	rewrite := context.Bool("rewrite")
+	persist := context.Bool("persist")
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.SnapshotManager.CheckSnapshots(id, revisions, tag, showStatistics, showTabular, checkFiles, searchFossils, resurrect)
+	backupManager.SnapshotManager.CheckSnapshots(id, revisions, tag, showStatistics, showTabular, checkFiles, checkChunks, searchFossils, resurrect, rewrite, threads, persist)
 
 	runScript(context, preference.Name, "post")
 }
@@ -964,10 +1044,11 @@ func printFile(context *cli.Context) {
 		snapshotID = context.String("id")
 	}
 
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
-	loadRSAPrivateKey(context.String("key"), preference, backupManager, false)
+	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	backupManager.SetupSnapshotCache(preference.Name)
 
@@ -1022,13 +1103,13 @@ func diff(context *cli.Context) {
 	}
 
 	compareByHash := context.Bool("hash")
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
-	loadRSAPrivateKey(context.String("key"), preference, backupManager, false)
+	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	backupManager.SetupSnapshotCache(preference.Name)
-	backupManager.SnapshotManager.Diff(repository, snapshotID, revisions, path, compareByHash, preference.NobackupFile, preference.FiltersFile)
+	backupManager.SnapshotManager.Diff(repository, snapshotID, revisions, path, compareByHash, preference.NobackupFile, preference.FiltersFile, preference.ExcludeByAttribute)
 
 	runScript(context, preference.Name, "post")
 }
@@ -1067,7 +1148,7 @@ func showHistory(context *cli.Context) {
 
 	revisions := getRevisions(context)
 	showLocalHash := context.Bool("hash")
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
@@ -1130,7 +1211,7 @@ func pruneSnapshots(context *cli.Context) {
 		os.Exit(ArgumentExitCode)
 	}
 
-	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "")
+	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
 	backupManager.SetupSnapshotCache(preference.Name)
@@ -1150,9 +1231,14 @@ func copySnapshots(context *cli.Context) {
 		os.Exit(ArgumentExitCode)
 	}
 
-	threads := context.Int("threads")
-	if threads < 1 {
-		threads = 1
+	uploadingThreads := context.Int("threads")
+	if uploadingThreads < 1 {
+		uploadingThreads = 1
+	}
+
+	downloadingThreads := context.Int("download-threads")
+	if downloadingThreads < 1 {
+		downloadingThreads = 1
 	}
 
 	repository, source := getRepositoryPreference(context, context.String("from"))
@@ -1160,7 +1246,7 @@ func copySnapshots(context *cli.Context) {
 	runScript(context, source.Name, "pre")
 
 	duplicacy.LOG_INFO("STORAGE_SET", "Source storage set to %s", source.StorageURL)
-	sourceStorage := duplicacy.CreateStorage(*source, false, threads)
+	sourceStorage := duplicacy.CreateStorage(*source, false, downloadingThreads)
 	if sourceStorage == nil {
 		return
 	}
@@ -1170,11 +1256,11 @@ func copySnapshots(context *cli.Context) {
 		sourcePassword = duplicacy.GetPassword(*source, "password", "Enter source storage password:", false, false)
 	}
 
-	sourceManager := duplicacy.CreateBackupManager(source.SnapshotID, sourceStorage, repository, sourcePassword, "", "")
+	sourceManager := duplicacy.CreateBackupManager(source.SnapshotID, sourceStorage, repository, sourcePassword, "", "", false)
 	sourceManager.SetupSnapshotCache(source.Name)
 	duplicacy.SavePassword(*source, "password", sourcePassword)
 
-	loadRSAPrivateKey(context.String("key"), source, sourceManager, false)
+	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), source, sourceManager, false)
 
 	_, destination := getRepositoryPreference(context, context.String("to"))
 
@@ -1190,7 +1276,7 @@ func copySnapshots(context *cli.Context) {
 	}
 
 	duplicacy.LOG_INFO("STORAGE_SET", "Destination storage set to %s", destination.StorageURL)
-	destinationStorage := duplicacy.CreateStorage(*destination, false, threads)
+	destinationStorage := duplicacy.CreateStorage(*destination, false, uploadingThreads)
 	if destinationStorage == nil {
 		return
 	}
@@ -1205,7 +1291,7 @@ func copySnapshots(context *cli.Context) {
 	destinationStorage.SetRateLimits(0, context.Int("upload-limit-rate"))
 
 	destinationManager := duplicacy.CreateBackupManager(destination.SnapshotID, destinationStorage, repository,
-		destinationPassword, "", "")
+		                                                  destinationPassword, "", "", false)
 	duplicacy.SavePassword(*destination, "password", destinationPassword)
 	destinationManager.SetupSnapshotCache(destination.Name)
 
@@ -1215,7 +1301,7 @@ func copySnapshots(context *cli.Context) {
 		snapshotID = context.String("id")
 	}
 
-	sourceManager.CopySnapshots(destinationManager, snapshotID, revisions, threads)
+	sourceManager.CopySnapshots(destinationManager, snapshotID, revisions, uploadingThreads, downloadingThreads)
 	runScript(context, source.Name, "post")
 }
 
@@ -1363,6 +1449,15 @@ func main() {
 					Usage:    "the minimum size of chunks (defaults to chunk-size/4)",
 					Argument: "<size>",
 				},
+				cli.StringFlag{
+					Name:     "zstd-level",
+					Usage:    "set zstd compression level (fastest, default, better, or best)",
+					Argument: "<level>",
+				},
+				cli.BoolFlag{
+					Name:     "zstd",
+					Usage:    "short for -zstd default",
+				},
 				cli.IntFlag{
 					Name:     "iterations",
 					Usage:    "the number of iterations used in storage key derivation (default is 16384)",
@@ -1387,6 +1482,11 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA public key to encrypt file chunks",
 					Argument: "<public key>",
+				},
+				cli.StringFlag{
+					Name:     "erasure-coding",
+					Usage:    "enable erasure coding to protect against storage corruption",
+					Argument: "<data shards>:<parity shards>",
 				},
 			},
 			Usage:     "Initialize the storage if necessary and the current directory as the repository",
@@ -1425,6 +1525,15 @@ func main() {
 					Name:  "dry-run",
 					Usage: "dry run for testing, don't backup anything. Use with -stats and -d",
 				},
+				cli.StringFlag{
+					Name:     "zstd-level",
+					Usage:    "set zstd compression level (fastest, default, better, or best)",
+					Argument: "<level>",
+				},
+				cli.BoolFlag{
+					Name:     "zstd",
+					Usage:    "short for -zstd default",
+				},
 				cli.BoolFlag{
 					Name:  "vss",
 					Usage: "enable the Volume Shadow Copy service (Windows and macOS using APFS only)",
@@ -1444,6 +1553,19 @@ func main() {
 					Name:  "enum-only",
 					Usage: "enumerate the repository recursively and then exit",
 				},
+				cli.IntFlag{
+					Name:     "metadata-chunk-size",
+					Value:    1024 * 1024,
+					Usage:    "the average size of metadata chunks (defaults to 1M)",
+					Argument: "<size>",
+				},
+				cli.IntFlag{
+					Name:     "max-in-memory-entries",
+					Value:    1024 * 1024,
+					Usage:    "the maximum number of entries kept in memory (defaults to 1M)",
+					Argument: "<number>",
+				},
+
 			},
 			Usage:     "Save a snapshot of the repository to the storage",
 			ArgsUsage: " ",
@@ -1499,6 +1621,15 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
+				},
+				cli.BoolFlag{
+					Name:  "persist",
+					Usage: "continue processing despite chunk errors or existing files (without -overwrite), reporting any affected files",
+        },
+				cli.StringFlag{
+					Name:     "key-passphrase",
+					Usage:    "the passphrase to decrypt the RSA private key",
+					Argument: "<private key passphrase>",
 				},
 			},
 			Usage:     "Restore the repository to a previously saved snapshot",
@@ -1586,8 +1717,16 @@ func main() {
 					Usage: "turn referenced fossils back into chunks",
 				},
 				cli.BoolFlag{
+					Name:  "rewrite",
+					Usage: "rewrite chunks with recoverable corruption",
+				},
+				cli.BoolFlag{
 					Name:  "files",
 					Usage: "verify the integrity of every file",
+				},
+				cli.BoolFlag{
+					Name:  "chunks",
+					Usage: "verify the integrity of every chunk",
 				},
 				cli.BoolFlag{
 					Name:  "stats",
@@ -1606,6 +1745,21 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
+				},
+				cli.StringFlag{
+					Name:     "key-passphrase",
+					Usage:    "the passphrase to decrypt the RSA private key",
+					Argument: "<private key passphrase>",
+				},
+				cli.IntFlag{
+					Name:     "threads",
+					Value:    1,
+					Usage:    "number of threads used to verify chunks",
+					Argument: "<n>",
+				},
+				cli.BoolFlag{
+					Name:  "persist",
+					Usage: "continue processing despite chunk errors, reporting any affected (corrupted) files",
 				},
 			},
 			Usage:     "Check the integrity of snapshots",
@@ -1634,6 +1788,11 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
+				},
+				cli.StringFlag{
+					Name:     "key-passphrase",
+					Usage:    "the passphrase to decrypt the RSA private key",
+					Argument: "<private key passphrase>",
 				},
 			},
 			Usage:     "Print to stdout the specified file, or the snapshot content if no file is specified",
@@ -1667,6 +1826,11 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
+				},
+				cli.StringFlag{
+					Name:     "key-passphrase",
+					Usage:    "the passphrase to decrypt the RSA private key",
+					Argument: "<private key passphrase>",
 				},
 			},
 			Usage:     "Compare two snapshots or two revisions of a file",
@@ -1813,6 +1977,15 @@ func main() {
 					Usage:    "the minimum size of chunks (default is chunk-size/4)",
 					Argument: "<size>",
 				},
+				cli.StringFlag{
+					Name:     "zstd-level",
+					Usage:    "set zstd compression level (fastest, default, better, or best)",
+					Argument: "<level>",
+				},
+				cli.BoolFlag{
+					Name:     "zstd",
+					Usage:    "short for -zstd default",
+				},
 				cli.IntFlag{
 					Name:     "iterations",
 					Usage:    "the number of iterations used in storage key derivation (default is 16384)",
@@ -1836,6 +2009,11 @@ func main() {
 					Name:     "key",
 					Usage:    "the RSA public key to encrypt file chunks",
 					Argument: "<public key>",
+				},
+				cli.StringFlag{
+					Name:     "erasure-coding",
+					Usage:    "enable erasure coding to protect against storage corruption",
+					Argument: "<data shards>:<parity shards>",
 				},
 			},
 			Usage:     "Add an additional storage to be used for the existing repository",
@@ -1875,6 +2053,12 @@ func main() {
 					Usage:    "Directories containing a file with this name will not be backed up",
 					Argument: "<file name>",
 					Value:    "",
+				},
+				cli.GenericFlag{
+					Name:  "exclude-by-attribute",
+					Usage: "Exclude files based on file attributes. (macOS only, com_apple_backup_excludeItem)",
+					Value: &TriBool{},
+					Arg:   "true",
 				},
 				cli.StringFlag{
 					Name:  "key",
@@ -1940,10 +2124,21 @@ func main() {
 					Usage:    "number of uploading threads",
 					Argument: "<n>",
 				},
+				cli.IntFlag{
+					Name:     "download-threads",
+					Value:    1,
+					Usage:    "number of downloading threads",
+					Argument: "<n>",
+				},
 				cli.StringFlag{
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks from the source storage",
-					Argument: "<public key>",
+					Argument: "<private key>",
+				},
+				cli.StringFlag{
+					Name:     "key-passphrase",
+					Usage:    "the passphrase to decrypt the RSA private key",
+					Argument: "<private key passphrase>",
 				},
 			},
 			Usage:     "Copy snapshots between compatible storages",
@@ -2053,13 +2248,28 @@ func main() {
 			Name:  "comment",
 			Usage: "add a comment to identify the process",
 		},
+		cli.StringSliceFlag{
+			Name:  "suppress, s",
+			Usage: "suppress logs with the specified id",
+			Argument: "<id>",
+		},
+		cli.BoolFlag{
+			Name:  "print-memory-usage",
+			Usage: "print memory usage every second",
+		},
 	}
 
 	app.HideVersion = true
 	app.Name = "duplicacy"
 	app.HelpName = "duplicacy"
 	app.Usage = "A new generation cloud backup tool based on lock-free deduplication"
-	app.Version = "2.3.0" + " (" + GitCommit + ")"
+	app.Version = "3.2.5" + " (" + GitCommit + ")"
+
+	// Exit with code 2 if an invalid command is provided
+	app.CommandNotFound = func(context *cli.Context, command string) {
+		fmt.Fprintf(context.App.Writer, "Invalid command: %s\n", command)
+		os.Exit(2)
+	}
 
 	// If the program is interrupted, call the RunAtError function.
 	c := make(chan os.Signal, 1)

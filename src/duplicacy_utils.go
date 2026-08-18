@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"runtime"
 
 	"github.com/gilbertchen/gopass"
 	"golang.org/x/crypto/pbkdf2"
@@ -434,7 +435,7 @@ func PrettyTime(seconds int64) string {
 			seconds/day, (seconds%day)/3600, (seconds%3600)/60, seconds%60)
 	} else if seconds > day {
 		return fmt.Sprintf("1 day %02d:%02d:%02d", (seconds%day)/3600, (seconds%3600)/60, seconds%60)
-	} else if seconds > 0 {
+	} else if seconds >= 0 {
 		return fmt.Sprintf("%02d:%02d:%02d", seconds/3600, (seconds%3600)/60, seconds%60)
 	} else {
 		return "n/a"
@@ -459,4 +460,17 @@ func AtoSize(sizeString string) int {
 	}
 
 	return size
+}
+
+func PrintMemoryUsage() {
+
+	for {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		LOG_INFO("MEMORY_STATS", "Currently allocated: %s, total allocated: %s, system memory: %s, number of GCs: %d",
+		         PrettySize(int64(m.Alloc)), PrettySize(int64(m.TotalAlloc)), PrettySize(int64(m.Sys)), m.NumGC)
+
+		time.Sleep(time.Second)
+	}
 }

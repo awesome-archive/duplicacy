@@ -19,13 +19,13 @@ type OneDriveStorage struct {
 }
 
 // CreateOneDriveStorage creates an OneDrive storage object.
-func CreateOneDriveStorage(tokenFile string, storagePath string, threads int) (storage *OneDriveStorage, err error) {
+func CreateOneDriveStorage(tokenFile string, isBusiness bool, storagePath string, threads int, client_id string, client_secret string, drive_id string) (storage *OneDriveStorage, err error) {
 
 	for len(storagePath) > 0 && storagePath[len(storagePath)-1] == '/' {
 		storagePath = storagePath[:len(storagePath)-1]
 	}
 
-	client, err := NewOneDriveClient(tokenFile)
+	client, err := NewOneDriveClient(tokenFile, isBusiness, client_id, client_secret, drive_id)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +80,7 @@ func (storage *OneDriveStorage) convertFilePath(filePath string) string {
 
 // ListFiles return the list of files and subdirectories under 'dir' (non-recursively)
 func (storage *OneDriveStorage) ListFiles(threadIndex int, dir string) ([]string, []int64, error) {
+
 	for len(dir) > 0 && dir[len(dir)-1] == '/' {
 		dir = dir[:len(dir)-1]
 	}
@@ -203,7 +204,7 @@ func (storage *OneDriveStorage) GetFileInfo(threadIndex int, filePath string) (e
 
 // DownloadFile reads the file at 'filePath' into the chunk.
 func (storage *OneDriveStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
-	readCloser, _, err := storage.client.DownloadFile(storage.storageDir + "/" + filePath)
+	readCloser, _, err := storage.client.DownloadFile(storage.storageDir + "/" + storage.convertFilePath(filePath))
 	if err != nil {
 		return err
 	}

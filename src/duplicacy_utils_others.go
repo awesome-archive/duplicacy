@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/gilbertchen/xattr"
+	"github.com/pkg/xattr"
 )
 
 func Readlink(path string) (isRegular bool, s string, err error) {
@@ -50,37 +50,38 @@ func SetOwner(fullPath string, entry *Entry, fileInfo *os.FileInfo) bool {
 func (entry *Entry) ReadAttributes(top string) {
 
 	fullPath := filepath.Join(top, entry.Path)
-	attributes, _ := xattr.Listxattr(fullPath)
+	attributes, _ := xattr.List(fullPath)
 	if len(attributes) > 0 {
-		entry.Attributes = make(map[string][]byte)
+		entry.Attributes = &map[string][]byte{}
 		for _, name := range attributes {
-			attribute, err := xattr.Getxattr(fullPath, name)
+			attribute, err := xattr.Get(fullPath, name)
 			if err == nil {
-				entry.Attributes[name] = attribute
+				(*entry.Attributes)[name] = attribute
 			}
 		}
 	}
 }
 
 func (entry *Entry) SetAttributesToFile(fullPath string) {
-	names, _ := xattr.Listxattr(fullPath)
+	names, _ := xattr.List(fullPath)
 
 	for _, name := range names {
 
-		newAttribute, found := entry.Attributes[name]
+
+		newAttribute, found := (*entry.Attributes)[name]
 		if found {
-			oldAttribute, _ := xattr.Getxattr(fullPath, name)
+			oldAttribute, _ := xattr.Get(fullPath, name)
 			if !bytes.Equal(oldAttribute, newAttribute) {
-				xattr.Setxattr(fullPath, name, newAttribute)
+				xattr.Set(fullPath, name, newAttribute)
 			}
-			delete(entry.Attributes, name)
+			delete(*entry.Attributes, name)
 		} else {
-			xattr.Removexattr(fullPath, name)
+			xattr.Remove(fullPath, name)
 		}
 	}
 
-	for name, attribute := range entry.Attributes {
-		xattr.Setxattr(fullPath, name, attribute)
+	for name, attribute := range *entry.Attributes {
+		xattr.Set(fullPath, name, attribute)
 	}
 
 }

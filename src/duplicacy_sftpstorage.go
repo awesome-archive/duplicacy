@@ -43,10 +43,10 @@ func CreateSFTPStorageWithPassword(server string, port int, username string, sto
 		return nil
 	}
 
-	return CreateSFTPStorage(server, port, username, storageDir, minimumNesting, authMethods, hostKeyCallback, threads)
+	return CreateSFTPStorage(false, server, port, username, storageDir, minimumNesting, authMethods, hostKeyCallback, threads)
 }
 
-func CreateSFTPStorage(server string, port int, username string, storageDir string, minimumNesting int,
+func CreateSFTPStorage(compatibilityMode bool, server string, port int, username string, storageDir string, minimumNesting int,
 	authMethods []ssh.AuthMethod,
 	hostKeyCallback func(hostname string, remote net.Addr,
 		key ssh.PublicKey) error, threads int) (storage *SFTPStorage, err error) {
@@ -57,8 +57,21 @@ func CreateSFTPStorage(server string, port int, username string, storageDir stri
 		HostKeyCallback: hostKeyCallback,
 	}
 
-	if server == "sftp.hidrive.strato.com" {
-		sftpConfig.Ciphers = []string{"aes128-ctr", "aes256-ctr"}
+	if compatibilityMode {
+		sftpConfig.Ciphers = []string{
+			"aes128-ctr", "aes192-ctr", "aes256-ctr",
+			"aes128-gcm@openssh.com",
+			"chacha20-poly1305@openssh.com",
+			"arcfour256", "arcfour128", "arcfour",
+			"aes128-cbc",
+			"3des-cbc",
+		}
+		sftpConfig.KeyExchanges = [] string {
+			"curve25519-sha256@libssh.org",
+			"ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+			"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
+			"diffie-hellman-group-exchange-sha1", "diffie-hellman-group-exchange-sha256",
+		}
 	}
 
 	serverAddress := fmt.Sprintf("%s:%d", server, port)
@@ -91,7 +104,7 @@ func CreateSFTPStorage(server string, port int, username string, storageDir stri
 		storageDir:      storageDir,
 		minimumNesting:  minimumNesting,
 		numberOfThreads: threads,
-		numberOfTries:   6,
+		numberOfTries:   8,
 		serverAddress:   serverAddress,
 		sftpConfig:      sftpConfig,
 	}
@@ -129,22 +142,19 @@ func (storage *SFTPStorage) retry(f func () error) error {
 			delay *= 2
 
 			storage.clientLock.Lock()
-			if storage.client != nil {
-				storage.client.Close()
-				storage.client = nil
-			}
-
 			connection, err := ssh.Dial("tcp", storage.serverAddress, storage.sftpConfig)
 			if err != nil {
+				LOG_WARN("SFTP_RECONNECT", "Failed to connect to %s: %v; retrying", storage.serverAddress, err)
 				storage.clientLock.Unlock()
-				return err
+				continue
 			}
 
 			client, err := sftp.NewClient(connection)
 			if err != nil {
+				LOG_WARN("SFTP_RECONNECT", "Failed to create a new SFTP client to %s: %v; retrying", storage.serverAddress, err)
 				connection.Close()
 				storage.clientLock.Unlock()
-				return err
+				continue
 			}
 			storage.client = client
 			storage.clientLock.Unlock()
@@ -275,36 +285,19 @@ func (storage *SFTPStorage) UploadFile(threadIndex int, filePath string, content
 	fullPath := path.Join(storage.storageDir, filePath)
 
 	dirs := strings.Split(filePath, "/")
-	if len(dirs) > 1 {
-		fullDir := path.Dir(fullPath)
-		err = storage.retry(func() error {
-			_, err := storage.getSFTPClient().Stat(fullDir)
-			return err
-		})
-		if err != nil {
-			// The error may be caused by a non-existent fullDir, or a broken connection.  In either case,
-			// we just assume it is the former because there isn't a way to tell which is the case.
-			for i := range dirs[1 : len(dirs)-1] {
-				subDir := path.Join(storage.storageDir, path.Join(dirs[0:i+2]...))
-				// We don't check the error; just keep going blindly but always store the last err
-				err = storage.getSFTPClient().Mkdir(subDir)
-			}
+	fullDir := path.Dir(fullPath)
+	return storage.retry(func() error {
 
-			// If there is an error creating the dirs, we check fullDir one more time, because another thread
-			// may happen to create the same fullDir ahead of this thread
-			if err != nil {
-				err = storage.retry(func() error {
-					_, err := storage.getSFTPClient().Stat(fullDir)
-					return err
-				})
-				if err != nil {
-					return err
+		if len(dirs) > 1 {
+			_, err := storage.getSFTPClient().Stat(fullDir)
+			if os.IsNotExist(err) {
+				for i := range dirs[1 : len(dirs)-1] {
+					subDir := path.Join(storage.storageDir, path.Join(dirs[0:i+2]...))
+					// We don't check the error; just keep going blindly
+					storage.getSFTPClient().Mkdir(subDir)
 				}
 			}
 		}
-	}
-
-	return storage.retry(func() error {
 
 		letters := "abcdefghijklmnopqrstuvwxyz"
 		suffix := make([]byte, 8)
@@ -325,7 +318,11 @@ func (storage *SFTPStorage) UploadFile(threadIndex int, filePath string, content
 			file.Close()
 			return err
 		}
-		file.Close()
+
+		err = file.Close()
+		if err != nil {
+			return err
+		}
 
 		err = storage.getSFTPClient().Rename(temporaryFile, fullPath)
 		if err != nil {

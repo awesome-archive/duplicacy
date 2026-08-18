@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -78,7 +79,7 @@ func (storage *FileStorage) ListFiles(threadIndex int, dir string) (files []stri
 
 	for _, f := range list {
 		name := f.Name()
-		if f.IsDir() && name[len(name)-1] != '/' {
+		if (f.IsDir() || f.Mode() & os.ModeSymlink != 0) && name[len(name)-1] != '/' {
 			name += "/"
 		}
 		files = append(files, name)
@@ -164,8 +165,8 @@ func (storage *FileStorage) UploadFile(threadIndex int, filePath string, content
 				return err
 			}
 		} else {
-			if !stat.IsDir() {
-				return fmt.Errorf("The path %s is not a directory", dir)
+			if !stat.IsDir() && stat.Mode() & os.ModeSymlink == 0 {
+				return fmt.Errorf("The path %s is not a directory or symlink", dir)
 			}
 		}
 	}
@@ -190,10 +191,13 @@ func (storage *FileStorage) UploadFile(threadIndex int, filePath string, content
 		return err
 	}
 
-	err = file.Sync()
-	if err != nil {
-		file.Close()
-		return err
+	if err = file.Sync(); err != nil {
+		pathErr, ok := err.(*os.PathError)
+		isNotSupported := ok && pathErr.Op == "sync" && pathErr.Err == syscall.ENOTSUP
+		if !isNotSupported {
+			_ = file.Close()
+			return err
+		}
 	}
 
 	err = file.Close()

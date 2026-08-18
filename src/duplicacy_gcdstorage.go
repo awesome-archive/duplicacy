@@ -20,13 +20,16 @@ import (
 
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
 
 var (
 	GCDFileMimeType      = "application/octet-stream"
 	GCDDirectoryMimeType = "application/vnd.google-apps.folder"
+	GCDUserDrive         = "root"
 )
 
 type GCDStorage struct {
@@ -37,6 +40,8 @@ type GCDStorage struct {
 	idCacheLock sync.Mutex
 	backoffs    []int // desired backoff time in seconds for each thread
 	attempts    []int // number of failed attempts since last success for each thread
+	driveID     string // the ID of the shared drive or 'root' (GCDUserDrive) if the user's drive
+	spaces      string // 'appDataFolder' if scope is drive.appdata; 'drive' otherwise
 
 	createDirectoryLock sync.Mutex
 	isConnected         bool
@@ -80,6 +85,10 @@ func (storage *GCDStorage) shouldRetry(threadIndex int, err error) (bool, error)
 			retry = true
 		} else if e.Code == 408 {
 			// Request timeout
+			message = e.Message
+			retry = true
+		} else if e.Code == 400 && strings.Contains(e.Message, "failedPrecondition") {
+			// Daily quota exceeded
 			message = e.Message
 			retry = true
 		} else if e.Code == 401 {
@@ -191,7 +200,11 @@ func (storage *GCDStorage) listFiles(threadIndex int, parentID string, listFiles
 		var err error
 
 		for {
-			fileList, err = storage.service.Files.List().Q(query).Fields("nextPageToken", "files(name, mimeType, id, size)").PageToken(startToken).PageSize(maxCount).Do()
+			q := storage.service.Files.List().Q(query).Fields("nextPageToken", "files(name, mimeType, id, size)").PageToken(startToken).PageSize(maxCount).Spaces(storage.spaces)
+			if storage.driveID != GCDUserDrive {
+				q = q.DriveId(storage.driveID).IncludeItemsFromAllDrives(true).Corpora("drive").SupportsAllDrives(true)
+			}
+			fileList, err = q.Do()
 			if retry, e := storage.shouldRetry(threadIndex, err); e == nil && !retry {
 				break
 			} else if retry {
@@ -219,7 +232,11 @@ func (storage *GCDStorage) listByName(threadIndex int, parentID string, name str
 
 	for {
 		query := "name = '" + name + "' and '" + parentID + "' in parents and trashed = false "
-		fileList, err = storage.service.Files.List().Q(query).Fields("files(name, mimeType, id, size)").Do()
+		q := storage.service.Files.List().Q(query).Fields("files(name, mimeType, id, size)").Spaces(storage.spaces)
+		if storage.driveID != GCDUserDrive {
+			q = q.DriveId(storage.driveID).IncludeItemsFromAllDrives(true).Corpora("drive").SupportsAllDrives(true)
+		}
+		fileList, err = q.Do()
 
 		if retry, e := storage.shouldRetry(threadIndex, err); e == nil && !retry {
 			break
@@ -239,6 +256,29 @@ func (storage *GCDStorage) listByName(threadIndex int, parentID string, name str
 	return file.Id, file.MimeType == GCDDirectoryMimeType, file.Size, nil
 }
 
+// Returns the id of the shared folder with the given name if it exists
+func (storage *GCDStorage) findSharedFolder(threadIndex int, name string) (string, error) {
+
+	query := "name = '" + name + "' and sharedWithMe and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
+	q := storage.service.Files.List().Q(query).Fields("files(name, mimeType, id, size)").Spaces(storage.spaces)
+	if storage.driveID != GCDUserDrive {
+		q = q.DriveId(storage.driveID).IncludeItemsFromAllDrives(true).Corpora("drive").SupportsAllDrives(true)
+	}
+
+	fileList, err := q.Do()
+	if err != nil {
+		return "", err
+	}
+
+	if len(fileList.Files) == 0 {
+		return "", nil
+	}
+
+	file := fileList.Files[0]
+
+	return file.Id, nil
+}
+
 // getIDFromPath returns the id of the given path.  If 'createDirectories' is true, create the given path and all its
 // parent directories if they don't exist.  Note that if 'createDirectories' is false, it may return an empty 'fileID'
 // if the file doesn't exist.
@@ -248,7 +288,7 @@ func (storage *GCDStorage) getIDFromPath(threadIndex int, filePath string, creat
 		return fileID, nil
 	}
 
-	fileID := "root"
+	fileID := storage.driveID
 
 	if rootID, ok := storage.findPathID(""); ok {
 		fileID = rootID
@@ -303,29 +343,87 @@ func (storage *GCDStorage) getIDFromPath(threadIndex int, filePath string, creat
 }
 
 // CreateGCDStorage creates a GCD storage object.
-func CreateGCDStorage(tokenFile string, storagePath string, threads int) (storage *GCDStorage, err error) {
+func CreateGCDStorage(tokenFile string, driveID string, storagePath string, threads int) (storage *GCDStorage, err error) {
+
+	ctx := context.Background()
 
 	description, err := ioutil.ReadFile(tokenFile)
 	if err != nil {
 		return nil, err
 	}
 
-	gcdConfig := &GCDConfig{}
-	if err := json.Unmarshal(description, gcdConfig); err != nil {
-		return nil, err
-	}
+	var object map[string]interface{}
 
-	oauth2Config := oauth2.Config{
-		ClientID:     gcdConfig.ClientID,
-		ClientSecret: gcdConfig.ClientSecret,
-		Endpoint:     gcdConfig.Endpoint,
-	}
-
-	authClient := oauth2Config.Client(context.Background(), &gcdConfig.Token)
-
-	service, err := drive.New(authClient)
+	err = json.Unmarshal(description, &object)
 	if err != nil {
 		return nil, err
+	}
+
+	isServiceAccount := false
+	if value, ok := object["type"]; ok {
+		if authType, ok := value.(string); ok && authType == "service_account" {
+			isServiceAccount = true
+		}
+	}
+
+	var tokenSource oauth2.TokenSource
+
+	scope := drive.DriveScope
+
+	if isServiceAccount {
+
+		if newScope, ok := object["scope"]; ok {
+			scope = newScope.(string)
+		}
+
+		config, err := google.JWTConfigFromJSON(description, scope)
+		if err != nil {
+			return nil, err
+		}
+
+		if subject, ok := object["subject"]; ok {
+		    config.Subject = subject.(string)
+		}
+
+		tokenSource = config.TokenSource(ctx)
+	} else {
+		gcdConfig := &GCDConfig{}
+		if err := json.Unmarshal(description, gcdConfig); err != nil {
+			return nil, err
+		}
+
+		config := oauth2.Config{
+			ClientID:     gcdConfig.ClientID,
+			ClientSecret: gcdConfig.ClientSecret,
+			Endpoint:     gcdConfig.Endpoint,
+		}
+		tokenSource = config.TokenSource(ctx, &gcdConfig.Token)
+	}
+
+	service, err := drive.NewService(ctx, option.WithTokenSource(tokenSource))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(driveID) == 0 {
+		driveID = GCDUserDrive
+	} else {
+		// In case the driveID is a name, convert it to an id
+		query := fmt.Sprintf("name='%s'", driveID)
+		driveList, err := drive.NewDrivesService(service).List().Q(query).Do()
+		if err == nil {
+			found := false
+			for _, drive := range driveList.Drives {
+				if drive.Name == driveID {
+					found = true
+					driveID = drive.Id
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("%s is not the id or name of a shared drive", driveID)
+			}
+		}
 	}
 
 	storage = &GCDStorage{
@@ -334,6 +432,8 @@ func CreateGCDStorage(tokenFile string, storagePath string, threads int) (storag
 		idCache:         make(map[string]string),
 		backoffs:        make([]int, threads),
 		attempts:        make([]int, threads),
+		driveID:         driveID,
+		spaces:          "drive",
 	}
 
 	for i := range storage.backoffs {
@@ -341,9 +441,29 @@ func CreateGCDStorage(tokenFile string, storagePath string, threads int) (storag
 		storage.attempts[i] = 0
 	}
 
-	storagePathID, err := storage.getIDFromPath(0, storagePath, true)
-	if err != nil {
-		return nil, err
+
+	if scope == drive.DriveAppdataScope {
+		storage.spaces = "appDataFolder"
+		storage.savePathID("", "appDataFolder")
+	} else {
+		storage.savePathID("", driveID)
+	}
+
+	storagePathID := ""
+
+	// When using service acount, check if storagePath is a shared folder which takes priority over regular folders.
+	if isServiceAccount && !strings.Contains(storagePath, "/") {
+		storagePathID, err = storage.findSharedFolder(0, storagePath)
+		if err != nil {
+			LOG_WARN("GCD_STORAGE", "Failed to check if %s is a shared folder: %v", storagePath, err)
+		}
+	}
+
+	if storagePathID == "" {
+		storagePathID, err = storage.getIDFromPath(0, storagePath, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Reset the id cache and start with 'storagePathID' as the root
@@ -415,39 +535,76 @@ func (storage *GCDStorage) ListFiles(threadIndex int, dir string) ([]string, []i
 		}
 		return files, nil, nil
 	} else {
-		files := []string{}
-		sizes := []int64{}
+		lock := sync.Mutex {}
+		allFiles := []string{}
+		allSizes := []int64{}
+
+		errorChannel := make(chan error)
+		directoryChannel := make(chan string)
+		activeWorkers := 0
 
 		parents := []string{"chunks", "fossils"}
-		for i := 0; i < len(parents); i++ {
-			parent := parents[i]
-			pathID, ok := storage.findPathID(parent)
-			if !ok {
-				continue
-			}
-			entries, err := storage.listFiles(threadIndex, pathID, true, true)
-			if err != nil {
-				return nil, nil, err
-			}
-			for _, entry := range entries {
-				if entry.MimeType != GCDDirectoryMimeType {
-					name := entry.Name
-					if strings.HasPrefix(parent, "fossils") {
-						name = parent + "/" + name + ".fsl"
-						name = name[len("fossils/"):]
-					} else {
-						name = parent + "/" + name
-						name = name[len("chunks/"):]
+		for len(parents) > 0 || activeWorkers > 0 {
+
+			if len(parents) > 0 && activeWorkers < storage.numberOfThreads {
+				parent := parents[0]
+				parents = parents[1:]
+				activeWorkers++
+				go func(parent string) {
+					pathID, ok := storage.findPathID(parent)
+					if !ok {
+						return
 					}
-					files = append(files, name)
-					sizes = append(sizes, entry.Size)
-				} else {
-					parents = append(parents, parent+"/"+entry.Name)
-					storage.savePathID(parent+"/"+entry.Name, entry.Id)
+					entries, err := storage.listFiles(threadIndex, pathID, true, true)
+					if err != nil {
+						errorChannel <- err
+						return
+					}
+
+					LOG_DEBUG("GCD_STORAGE", "Listing %s; %d items returned", parent, len(entries))
+
+					files := []string {}
+					sizes := []int64 {}
+					for _, entry := range entries {
+						if entry.MimeType != GCDDirectoryMimeType {
+							name := entry.Name
+							if strings.HasPrefix(parent, "fossils") {
+								name = parent + "/" + name + ".fsl"
+								name = name[len("fossils/"):]
+							} else {
+								name = parent + "/" + name
+								name = name[len("chunks/"):]
+							}
+							files = append(files, name)
+							sizes = append(sizes, entry.Size)
+						} else {
+							directoryChannel <- parent+"/"+entry.Name
+							storage.savePathID(parent+"/"+entry.Name, entry.Id)
+						}
+					}
+					lock.Lock()
+					allFiles = append(allFiles, files...)
+					allSizes = append(allSizes, sizes...)
+					lock.Unlock()
+					directoryChannel <- ""
+				} (parent)
+			}
+
+			if activeWorkers > 0 {
+				select {
+				case err := <- errorChannel:
+					return nil, nil, err
+				case directory := <- directoryChannel:
+					if directory == "" {
+						activeWorkers--
+					} else {
+						parents = append(parents, directory)
+					}
 				}
 			}
 		}
-		return files, sizes, nil
+
+		return allFiles, allSizes, nil
 	}
 
 }
@@ -462,7 +619,7 @@ func (storage *GCDStorage) DeleteFile(threadIndex int, filePath string) (err err
 	}
 
 	for {
-		err = storage.service.Files.Delete(fileID).Fields("id").Do()
+		err = storage.service.Files.Delete(fileID).SupportsAllDrives(true).Fields("id").Do()
 		if retry, err := storage.shouldRetry(threadIndex, err); err == nil && !retry {
 			storage.deletePathID(filePath)
 			return nil
@@ -508,7 +665,7 @@ func (storage *GCDStorage) MoveFile(threadIndex int, from string, to string) (er
 	}
 
 	for {
-		_, err = storage.service.Files.Update(fileID, nil).AddParents(toParentID).RemoveParents(fromParentID).Do()
+		_, err = storage.service.Files.Update(fileID, nil).SupportsAllDrives(true).AddParents(toParentID).RemoveParents(fromParentID).Do()
 		if retry, err := storage.shouldRetry(threadIndex, err); err == nil && !retry {
 			break
 		} else if retry {
@@ -559,7 +716,7 @@ func (storage *GCDStorage) CreateDirectory(threadIndex int, dir string) (err err
 			Parents:  []string{parentID},
 		}
 
-		file, err = storage.service.Files.Create(file).Fields("id").Do()
+		file, err = storage.service.Files.Create(file).SupportsAllDrives(true).Fields("id").Do()
 		if retry, err := storage.shouldRetry(threadIndex, err); err == nil && !retry {
 			break
 		} else {
@@ -617,7 +774,7 @@ func (storage *GCDStorage) GetFileInfo(threadIndex int, filePath string) (exist 
 // DownloadFile reads the file at 'filePath' into the chunk.
 func (storage *GCDStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
 	// We never download the fossil so there is no need to convert the path
-	fileID, err := storage.getIDFromPath(threadIndex, filePath, false)
+	fileID, err := storage.getIDFromPath(threadIndex, storage.convertFilePath(filePath), false)
 	if err != nil {
 		return err
 	}
@@ -630,7 +787,7 @@ func (storage *GCDStorage) DownloadFile(threadIndex int, filePath string, chunk 
 	for {
 		// AcknowledgeAbuse(true) lets the download proceed even if GCD thinks that it contains malware.
 		// TODO: Should this prompt the user or log a warning?
-		req := storage.service.Files.Get(fileID)
+		req := storage.service.Files.Get(fileID).SupportsAllDrives(true)
 		if e, ok := err.(*googleapi.Error); ok {
 			if strings.Contains(err.Error(), "cannotDownloadAbusiveFile") || len(e.Errors) > 0 && e.Errors[0].Reason == "cannotDownloadAbusiveFile" {
 				LOG_WARN("GCD_STORAGE", "%s is marked as abusive, will download anyway.", filePath)
@@ -676,7 +833,7 @@ func (storage *GCDStorage) UploadFile(threadIndex int, filePath string, content 
 
 	for {
 		reader := CreateRateLimitedReader(content, storage.UploadRateLimit/storage.numberOfThreads)
-		_, err = storage.service.Files.Create(file).Media(reader).Fields("id").Do()
+		_, err = storage.service.Files.Create(file).SupportsAllDrives(true).Media(reader).Fields("id").Do()
 		if retry, err := storage.shouldRetry(threadIndex, err); err == nil && !retry {
 			break
 		} else if retry {
